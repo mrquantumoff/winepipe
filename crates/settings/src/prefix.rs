@@ -108,16 +108,21 @@ pub fn discover(extra: &[PathBuf]) -> Vec<Prefix> {
 
 /// Registry key line for `key` in Wine's .reg file syntax (backslashes doubled).
 fn key_header(key: &str) -> String {
-    format!("[{}]", key.replace('\\', "\\\\")).to_ascii_lowercase()
+    format!("[{}]", key.replace('\\', "\\\\"))
 }
 
-/// Lines of the section for `key` in a Wine registry file.
+/// Lines of the section for `key` in a Wine registry file. Registry files
+/// run to several MB with tens of thousands of keys, so the header match is
+/// a case-insensitive prefix compare without allocating per line.
 fn section<'a>(text: &'a str, key: &str) -> Option<Vec<&'a str>> {
     let header = key_header(key);
+    let h = header.as_bytes();
     let mut lines = text.lines();
     lines.find(|l| {
-        let l = l.trim_start();
-        l.starts_with('[') && l.split(']').next().map(|h| format!("{h}]").to_ascii_lowercase()) == Some(header.clone())
+        let l = l.trim_start().as_bytes();
+        l.len() >= h.len()
+            && l[..h.len()].eq_ignore_ascii_case(h)
+            && l.get(h.len()).is_none_or(|&c| c == b' ' || c == b'\t')
     })?;
     Some(lines.take_while(|l| !l.starts_with('[')).collect())
 }
@@ -214,6 +219,14 @@ pub fn reg_file(s: &Settings) -> String {
         s.int32 as u32,
         escape(&s.client_name),
     )
+}
+
+/// Expand a leading `~/` (the Wine binary field is free text).
+pub fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
 }
 
 fn wine_command(wine: &str, prefix: &Path) -> Command {
@@ -340,6 +353,10 @@ fn guess_from_launchers(prefix: &Path) -> Option<String> {
         }
     }
     for f in files {
+        // Launchers are small scripts / desktop entries; skip binaries.
+        if f.metadata().map_or(true, |m| m.len() > 64 * 1024) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
         let mentions = text.contains(&pstr) || rel.as_ref().is_some_and(|r| text.contains(&format!("$HOME/{r}")));
         if !mentions {
@@ -412,5 +429,18 @@ mod tests {
             assert!(text.contains(want), "{want} missing in:\n{text}");
         }
         save_settings("wine", &prefix, &Settings::default()).unwrap();
+    }
+
+    /// Real-prefix check: `WINEPIPE_TEST_PREFIX=... cargo test -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_prefix_scan() {
+        let Some(prefix) = std::env::var_os("WINEPIPE_TEST_PREFIX").map(PathBuf::from) else { return };
+        let t = std::time::Instant::now();
+        let r = registration(&prefix);
+        let s = load_settings(&prefix);
+        let all = discover(&[]);
+        println!("registration {r:?} settings {s:?} prefixes {} in {:?}", all.len(), t.elapsed());
+        assert!(r.x64);
     }
 }

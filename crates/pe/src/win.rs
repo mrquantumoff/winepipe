@@ -60,6 +60,7 @@ pub const MEM_RESERVE: DWORD = 0x2000;
 pub const MEM_RELEASE: DWORD = 0x8000;
 pub const PAGE_READWRITE: DWORD = 0x04;
 
+pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: DWORD = 4;
 pub const INFINITE: DWORD = 0xFFFF_FFFF;
 pub const WAIT_OBJECT_0: DWORD = 0;
 pub const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
@@ -86,6 +87,9 @@ extern "system" {
         flags: DWORD,
         tid: *mut DWORD,
     ) -> HANDLE;
+    pub fn GetModuleHandleExW(flags: DWORD, name: *const u16, out: *mut HMODULE) -> BOOL;
+    pub fn FreeLibrary(module: HMODULE) -> BOOL;
+    pub fn FreeLibraryAndExitThread(module: HMODULE, code: DWORD) -> !;
     pub fn SetThreadPriority(thread: HANDLE, prio: i32) -> BOOL;
     pub fn WaitForSingleObject(h: HANDLE, ms: DWORD) -> DWORD;
     pub fn CloseHandle(h: HANDLE) -> BOOL;

@@ -86,9 +86,10 @@ enum Message {
     Defaults,
     Revert,
     Save,
-    Saved(Result<(), String>),
+    /// (prefix, wine, what was written, result)
+    Saved(PathBuf, String, Settings, Result<(), String>),
     Register,
-    Registered(Result<String, String>),
+    Registered(PathBuf, Result<String, String>),
 }
 
 #[derive(Clone, PartialEq)]
@@ -143,10 +144,9 @@ impl App {
         self.outputs_label = self.edit.outputs.to_string();
     }
 
-    fn refresh_registration(&mut self) {
-        if let Some(i) = self.selected {
-            let reg = prefix::registration(&self.prefixes[i].path);
-            self.prefixes[i].registration = reg;
+    fn refresh_registration(&mut self, path: &std::path::Path) {
+        if let Some(p) = self.prefixes.iter_mut().find(|p| p.path == path) {
+            p.registration = prefix::registration(path);
             self.labels = self.prefixes.iter().map(Prefix::label).collect();
         }
     }
@@ -313,7 +313,9 @@ impl Application for App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SelectPrefix(i) => {
-                if i < self.prefixes.len() {
+                // Results of a running save/registration belong to the
+                // prefix they were started for; keep it selected meanwhile.
+                if i < self.prefixes.len() && !self.busy() {
                     self.selected = Some(i);
                     // an explicit --wine only applies to the prefix it came with
                     self.wine_override = None;
@@ -353,39 +355,40 @@ impl Application for App {
                     s.client_name = Settings::default().client_name;
                 }
                 self.edit = s.clone();
-                let wine = self.wine.trim().to_string();
+                let wine = prefix::expand_home(self.wine.trim());
                 self.status = Status::Busy("Saving…".into());
                 return cosmic::task::future(async move {
-                    let r = tokio::task::spawn_blocking(move || prefix::save_settings(&wine, &p, &s))
+                    let (p2, w2, s2) = (p.clone(), wine.clone(), s.clone());
+                    let r = tokio::task::spawn_blocking(move || prefix::save_settings(&w2, &p2, &s2))
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()));
-                    Message::Saved(r)
+                    Message::Saved(p, wine, s, r)
                 });
             }
-            Message::Saved(r) => match r {
+            Message::Saved(path, wine, written, r) => match r {
                 Ok(()) => {
-                    self.saved = self.edit.clone();
-                    if let Some(p) = self.prefix().map(|p| p.path.clone()) {
-                        let w = self.wine.trim().to_string();
-                        self.binaries.set(&p, &w);
+                    if self.prefix().is_some_and(|p| p.path == path) {
+                        self.saved = written;
                     }
+                    self.binaries.set(&path, &wine);
                     self.status = Status::Ok("Saved. Restart the application (or reopen its audio device) to apply.".into());
                 }
                 Err(e) => self.status = Status::Error(e),
             },
             Message::Register => {
                 let Some(p) = self.prefix().map(|p| p.path.clone()) else { return Task::none() };
-                let wine = self.wine.trim().to_string();
+                let wine = prefix::expand_home(self.wine.trim());
                 self.status = Status::Busy("Registering the driver…".into());
                 return cosmic::task::future(async move {
-                    let r = tokio::task::spawn_blocking(move || prefix::register(&wine, &p))
+                    let p2 = p.clone();
+                    let r = tokio::task::spawn_blocking(move || prefix::register(&wine, &p2))
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()));
-                    Message::Registered(r)
+                    Message::Registered(p, r)
                 });
             }
-            Message::Registered(r) => {
-                self.refresh_registration();
+            Message::Registered(path, r) => {
+                self.refresh_registration(&path);
                 self.status = match r {
                     Ok(_) => Status::Ok("Driver registered.".into()),
                     Err(e) => Status::Error(format!("Registration failed: {}", e.lines().last().unwrap_or(""))),

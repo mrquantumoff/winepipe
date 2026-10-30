@@ -141,16 +141,59 @@ static LAT_CHANGES: AtomicU32 = AtomicU32::new(0);
 static RATE_CHANGES: AtomicU32 = AtomicU32::new(0);
 static SAMPLE_POS_ERRORS: AtomicU32 = AtomicU32::new(0);
 static LAST_POS: AtomicI64 = AtomicI64::new(-1);
+static INLINE_RESTART: AtomicBool = AtomicBool::new(false);
+static QUERY_IN_CALLBACK: AtomicBool = AtomicBool::new(false);
+static IN_CALLBACK: AtomicU32 = AtomicU32::new(0);
+static OVERLAPS: AtomicU32 = AtomicU32::new(0);
+static RESTARTS: AtomicU32 = AtomicU32::new(0);
+/// Set while the callback is busy in host code (query mode).
+static IN_HOST_WORK: AtomicBool = AtomicBool::new(false);
+static CB_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 unsafe fn process(index: i32, sample_pos: Option<u64>) {
+    // Two bufferSwitch calls at once would mean two live callback threads.
+    if IN_CALLBACK.fetch_add(1, SeqCst) != 0 {
+        OVERLAPS.fetch_add(1, SeqCst);
+    }
+    process_inner(index, sample_pos);
+    IN_CALLBACK.fetch_sub(1, SeqCst);
+}
+
+unsafe fn process_inner(index: i32, sample_pos: Option<u64>) {
     let Some(h) = (*HOST.0.get()).as_mut() else { return };
     let n = CALLS.fetch_add(1, Relaxed);
+    if QUERY_IN_CALLBACK.load(Relaxed) {
+        // Hosts call back into the driver from bufferSwitch all the time.
+        // Spend a while in the callback first so a stop() from the main
+        // thread is likely to land while we are in here.
+        let t0 = qpc();
+        IN_HOST_WORK.store(true, SeqCst);
+        Sleep(1);
+        let d = Driver(h.driver);
+        let mut r = 0.0;
+        d.get_sample_rate(&mut r);
+        let (mut il, mut ol) = (0, 0);
+        d.get_latencies(&mut il, &mut ol);
+        IN_HOST_WORK.store(false, SeqCst);
+        CB_TICKS.fetch_add((qpc() - t0) as u64, Relaxed);
+    }
+    if INLINE_RESTART.load(Relaxed) && n == 100 {
+        // A host resetting its stream from inside the callback.
+        let d = Driver(h.driver);
+        d.stop();
+        d.start();
+        RESTARTS.fetch_add(1, Relaxed);
+    }
     if n < h.stamps.capacity() {
         h.stamps.push(qpc());
     }
     if let Some(p) = sample_pos {
         let last = LAST_POS.swap(p as i64, Relaxed);
-        if last >= 0 && p as i64 - last != h.bufsize as i64 && p as i64 - last != 2 * h.bufsize as i64 {
+        // Forward jumps by whole blocks are skipped (late) blocks; a position
+        // that repeats, goes back, or leaves the block grid is a bug (e.g. a
+        // block delivered twice).
+        let d = p as i64 - last;
+        if last >= 0 && (d <= 0 || d % h.bufsize as i64 != 0) {
             SAMPLE_POS_ERRORS.fetch_add(1, Relaxed);
         }
     }
@@ -274,6 +317,8 @@ fn parse_args() -> Args {
             "--cycles" => a.cycles = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
             "--sine" => a.sine = true,
             "--control-panel" => a.control_panel = true,
+            "--inline-restart" => INLINE_RESTART.store(true, Relaxed),
+            "--query-in-callback" => QUERY_IN_CALLBACK.store(true, Relaxed),
             "--loopback" => a.loopback = true,
             "--output-ready" => a.output_ready = true,
             "--no-timeinfo" => TIMEINFO.store(false, Relaxed),
@@ -406,7 +451,17 @@ fn main() {
             std::process::exit(1);
         }
         unsafe { Sleep((args.seconds * 1000.0) as u32) };
+        if QUERY_IN_CALLBACK.load(Relaxed) {
+            // Stop while the callback thread is inside host code that is
+            // about to call back into the driver.
+            let until = qpc() + freq as i64;
+            while !IN_HOST_WORK.load(SeqCst) && qpc() < until {
+                std::hint::spin_loop();
+            }
+        }
+        let t_stop = qpc();
         check("stop", d.stop());
+        let stop_ms = (qpc() - t_stop) as f64 * 1000.0 / freq;
         let calls = CALLS.load(Relaxed);
         unsafe { Sleep(50) };
         let after = CALLS.load(Relaxed);
@@ -418,6 +473,20 @@ fn main() {
         let h = unsafe { (*HOST.0.get()).take().unwrap() };
         println!("--- run {} ---", cycle + 1);
         println!("callbacks: {calls} (expected ~{expected}), after stop: {}", after - calls);
+        println!(
+            "stop took {stop_ms:.1} ms; overlapping callbacks {}; inline restarts {}",
+            OVERLAPS.load(SeqCst),
+            RESTARTS.load(Relaxed)
+        );
+        if QUERY_IN_CALLBACK.load(Relaxed) && calls > 0 {
+            println!("time in callback: {:.0} us avg", CB_TICKS.load(Relaxed) as f64 * 1e6 / freq / calls as f64);
+        }
+        // An inline restart legitimately resets the position once; any
+        // further jump means a block was delivered twice or skipped.
+        let pos_errors_allowed = RESTARTS.load(Relaxed);
+        if OVERLAPS.load(SeqCst) != 0 || stop_ms > 1000.0 || SAMPLE_POS_ERRORS.load(Relaxed) > pos_errors_allowed {
+            fail = true;
+        }
         if h.stamps.len() > 10 {
             let period_us = bufsize as f64 * 1e6 / rate;
             let iv: Vec<f64> = h.stamps.windows(2).skip(5).map(|w| (w[1] - w[0]) as f64 * 1e6 / freq).collect();
@@ -428,7 +497,7 @@ fn main() {
             println!("interval: mean {mean:.1} us (period {period_us:.1}), min {min:.1}, max {max:.1}, stddev {sd:.1}");
         }
         if have_stats {
-            let avg = if stats.switches > 0 { stats.handoff_total_ns / stats.switches } else { 0 };
+            let avg = stats.handoff_total_ns.checked_div(stats.switches).unwrap_or(0);
             println!(
                 "driver: cycles {} switches {} late {} skipped {} underrun_frames {} graph_xruns {}",
                 stats.cycles, stats.switches, stats.late, stats.skipped, stats.underrun_frames, stats.graph_xruns

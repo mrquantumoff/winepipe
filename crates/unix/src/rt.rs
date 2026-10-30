@@ -64,13 +64,27 @@ pub enum Outcome {
     Aborted,
 }
 
-/// Shared state of the handshake. `req_seq` is advanced only by the RT thread,
-/// `done_seq` only by the callback thread; both double as futex words.
+/// Shared state of the handshake.
+///
+/// `req_seq` is advanced only by the RT thread, `done_seq` only by the
+/// callback thread. Sleepers never wait on those values directly: each side
+/// has a *doorbell* futex word that every waker increments before waking.
+/// A sleeper reads its bell before checking its conditions, so a wake that
+/// happens in between changes the bell and the futex wait returns at once.
+/// No wakeup can be lost, including the ones from `raise` and `halt`, which
+/// change neither sequence number.
 pub struct Handoff {
     pub state: AtomicU32,
     busy: AtomicU32,
     req_seq: AtomicU32,
     done_seq: AtomicU32,
+    /// Doorbell of the callback thread (new block, event, stop).
+    host_bell: AtomicU32,
+    /// Doorbell of the RT thread (block done, stop).
+    rt_bell: AtomicU32,
+    /// Set once the callback thread waits for blocks; until then the RT side
+    /// stays silent instead of issuing blocks nobody can take.
+    armed: AtomicU32,
     events: AtomicU32,
     sw_index: AtomicU32,
     sw_rate: AtomicU32,
@@ -92,6 +106,9 @@ impl Handoff {
             busy: AtomicU32::new(0),
             req_seq: AtomicU32::new(0),
             done_seq: AtomicU32::new(0),
+            host_bell: AtomicU32::new(0),
+            rt_bell: AtomicU32::new(0),
+            armed: AtomicU32::new(0),
             events: AtomicU32::new(0),
             sw_index: AtomicU32::new(0),
             sw_rate: AtomicU32::new(0),
@@ -105,17 +122,39 @@ impl Handoff {
         self.state.load(Acquire) == STATE_RUNNING
     }
 
+    #[inline]
+    fn ring_host(&self, all: bool) {
+        self.host_bell.fetch_add(1, Release);
+        if all {
+            futex::wake_all(&self.host_bell);
+        } else {
+            futex::wake(&self.host_bell, 1);
+        }
+    }
+
+    #[inline]
+    fn ring_rt(&self) {
+        self.rt_bell.fetch_add(1, Release);
+        futex::wake_all(&self.rt_bell);
+    }
+
     /// Queue an event for the host and nudge the callback thread so it is
     /// delivered promptly. RT-safe (one futex syscall).
     pub fn raise(&self, ev: u32) {
         self.events.fetch_or(ev, AcqRel);
-        futex::wake(&self.req_seq, 1);
+        self.ring_host(false);
     }
 
     /// True when the host has finished every block handed to it.
     #[inline]
     pub fn host_idle(&self) -> bool {
         self.done_seq.load(Acquire) == self.req_seq.load(Relaxed)
+    }
+
+    /// True once the callback thread of the current run is waiting for blocks.
+    #[inline]
+    pub fn armed(&self) -> bool {
+        self.armed.load(Acquire) != 0
     }
 
     // ---- RT thread side -------------------------------------------------
@@ -149,12 +188,12 @@ impl Handoff {
         let seq = self.req_seq.load(Relaxed).wrapping_add(1);
         let t0 = futex::now_ns();
         self.req_seq.store(seq, Release);
-        futex::wake(&self.req_seq, 1);
+        self.ring_host(false);
         self.stats.switches.fetch_add(1, Relaxed);
 
         loop {
-            let done = self.done_seq.load(Acquire);
-            if done == seq {
+            let bell = self.rt_bell.load(Acquire);
+            if self.done_seq.load(Acquire) == seq {
                 let dt = futex::now_ns().saturating_sub(t0);
                 self.stats.handoff_last_ns.store(dt, Relaxed);
                 self.stats.handoff_total_ns.fetch_add(dt, Relaxed);
@@ -164,7 +203,7 @@ impl Handoff {
             if self.state.load(Acquire) != STATE_RUNNING {
                 return Outcome::Aborted;
             }
-            if !futex::wait(&self.done_seq, done, deadline_ns) && self.done_seq.load(Acquire) != seq {
+            if !futex::wait(&self.rt_bell, bell, deadline_ns) && self.done_seq.load(Acquire) != seq {
                 self.stats.late.fetch_add(1, Relaxed);
                 return Outcome::Late;
             }
@@ -180,8 +219,13 @@ impl Handoff {
         p.events = 0;
         p.result = 0;
         self.complete(p.last_done);
+        if self.armed.swap(1, AcqRel) == 0 {
+            // First wait of this run: blocks may flow from now on.
+            self.ring_host(false);
+        }
         let deadline = futex::now_ns() + u64::from(p.timeout_ms.max(1)) * 1_000_000;
         loop {
+            let bell = self.host_bell.load(Acquire);
             let req = self.req_seq.load(Acquire);
             if req != p.last_done {
                 p.result = abi::WAIT_SWITCH;
@@ -203,7 +247,7 @@ impl Handoff {
                 p.result = abi::WAIT_STOPPED;
                 break;
             }
-            if !futex::wait(&self.req_seq, req, deadline) {
+            if !futex::wait(&self.host_bell, bell, deadline) {
                 p.result = abi::WAIT_TIMEOUT;
                 break;
             }
@@ -216,18 +260,20 @@ impl Handoff {
     pub fn complete(&self, seq: u32) {
         if self.done_seq.load(Relaxed) != seq && self.req_seq.load(Acquire) == seq {
             self.done_seq.store(seq, Release);
-            futex::wake(&self.done_seq, 1);
+            self.ring_rt();
         }
     }
 
     // ---- control side -----------------------------------------------------
 
     /// Switch to RUNNING. Returns the sequence number the callback thread
-    /// starts from.
+    /// starts from. A pending reset request survives: the host must still
+    /// learn that the connection broke.
     pub fn begin(&self) -> u32 {
         let seq = self.req_seq.load(Acquire);
         self.done_seq.store(seq, Release);
-        self.events.store(0, Release);
+        self.events.fetch_and(abi::EVENT_RESET_REQUEST, AcqRel);
+        self.armed.store(0, Release);
         self.stats.reset_counters();
         self.state.store(STATE_RUNNING, SeqCst);
         seq
@@ -240,14 +286,15 @@ impl Handoff {
             self.state.store(STATE_IDLE, SeqCst);
             return;
         }
-        futex::wake_all(&self.done_seq);
-        futex::wake_all(&self.req_seq);
+        self.ring_rt();
+        self.ring_host(true);
         let give_up = futex::now_ns() + 3_000_000_000;
         while self.busy.load(SeqCst) != 0 && futex::now_ns() < give_up {
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
         self.state.store(STATE_IDLE, SeqCst);
-        futex::wake_all(&self.req_seq);
+        self.armed.store(0, Release);
+        self.ring_host(true);
     }
 }
 
@@ -330,6 +377,8 @@ pub struct Session {
     last_n: usize,
     fifo: bool,
     prefill: usize,
+    /// Latency (frames) the host was last told about, per direction.
+    reported_latency: usize,
     mask: usize,
     in_ring: Vec<Vec<f32>>,
     out_ring: Vec<Vec<f32>>,
@@ -360,6 +409,7 @@ impl Session {
             last_n: 0,
             fifo: false,
             prefill: 0,
+            reported_latency: bufsize,
             mask: cap - 1,
             in_rd: 0,
             in_len: 0,
@@ -375,6 +425,8 @@ impl Session {
         self.last_n = 0;
         self.fifo = false;
         self.prefill = 0;
+        // Before start the host is told `bufsize` (the quantum we force).
+        self.reported_latency = self.bufsize;
         self.in_rd = 0;
         self.in_len = 0;
         self.out_rd = 0;
@@ -389,7 +441,10 @@ impl Session {
     fn configure(&mut self, n: usize, h: &Handoff) {
         self.last_n = n;
         let p = fifo_prefill(n, self.bufsize);
-        if p != self.prefill {
+        // Matches Engine::get_info: max(quantum, buffer) (+ FIFO pre-fill).
+        let latency = n.max(self.bufsize) + p;
+        if latency != self.reported_latency {
+            self.reported_latency = latency;
             h.raise(abi::EVENT_LATENCY_CHANGED);
         }
         self.fifo = p != 0;
@@ -415,6 +470,17 @@ impl Session {
     pub unsafe fn process(&mut self, h: &Handoff, inp: &[*const f32], out: &[*mut f32], cyc: &Cycle) {
         let n = cyc.n;
         if n == 0 {
+            return;
+        }
+        if !h.armed() {
+            // The callback thread is not up yet: issuing a block now would
+            // only run into the deadline. Stay silent until it is.
+            for c in &self.outs {
+                zero(out.get(c.port).copied().unwrap_or(std::ptr::null_mut()), 0, n);
+            }
+            for &p in &self.idle_outs {
+                zero(out.get(p).copied().unwrap_or(std::ptr::null_mut()), 0, n);
+            }
             return;
         }
         if n != self.last_n {

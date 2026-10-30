@@ -71,8 +71,12 @@ side. It spends its life blocked inside a single unix call (`WAIT`) on a
 futex. The Unix side promotes it to `SCHED_FIFO` through PipeWire's
 `ThreadUtils` (module-rt: direct RT scheduling or RTKit).
 
-Two futex words carry the handshake. `req_seq` is written by the RT thread
-and `done_seq` by the callback thread.
+Two sequence numbers carry the handshake. `req_seq` is written by the RT
+thread and `done_seq` by the callback thread. Nobody sleeps on them
+directly: each side sleeps on its own *doorbell* futex word, which every
+waker increments before waking. A sleeper reads its bell before checking its
+conditions, so a wake that arrives in between (a new block, an event, a
+stop) changes the bell and the sleep returns at once. No wakeup can be lost.
 
 ```
 RT thread (process)                         callback thread (PE)
@@ -96,10 +100,35 @@ driver's next wakeup) minus a safety margin, and clamped to
   issued, so the host and the RT thread never touch the same half-buffer;
 * once the host catches up, the next cycle continues normally.
 
-Stopping sets the state to `STOPPING`, wakes both futexes, and waits (one
+After `start()` the RT side stays silent until the callback thread's first
+WAIT has *armed* it. Blocks issued before anyone can take them would only run
+into the deadline.
+
+Stopping sets the state to `STOPPING`, rings both doorbells, and waits (one
 period at most) for any in-flight `process()` to leave the session before
 buffers are released. So `disposeBuffers()` can never free memory the RT
 thread is still using.
+
+Hosts call back into the driver from their callbacks, including `stop()`,
+`start()`, `disposeBuffers()` and `Release()`. The PE side survives that
+like this:
+
+* Every `start()`/`stop()` bumps a *run generation*. A callback thread
+  re-checks its generation after every call into the host and exits when
+  it's stale, so a thread that was stopped from inside its own bufferSwitch
+  can never process another block, even when the host restarts the stream
+  inline.
+* The driver mutex is never held while calling into the Unix side's STOP or
+  while joining a callback thread, so a host that calls `getSampleRate()`
+  from bufferSwitch can't deadlock a concurrent `stop()`.
+* Threads that can't be joined (the calling thread itself, or one stuck in
+  the host) are kept and joined later. If another thread may still be
+  inside the host, ASIO buffers (and on `Release`, the engine) are leaked
+  rather than freed under it.
+* Events (`sampleRateDidChange`, `kAsioLatenciesChanged`,
+  `kAsioResetRequest`) are delivered after the block is handed back, never
+  while the RT thread waits on its deadline.
+* The callback thread pins `winepipe.dll` while it runs.
 
 ## Buffer size vs. graph quantum
 

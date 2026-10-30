@@ -28,11 +28,12 @@ struct CbShared {
     time_info: AtomicBool,
     can_reset: AtomicBool,
     can_latency: AtomicBool,
-    stop: AtomicBool,
+    /// Run generation. start()/stop() bump it; a callback thread whose
+    /// generation is stale exits instead of touching the stream again.
+    gen: AtomicU32,
     start_seq: AtomicU32,
     /// Sequence number of the block the host is currently processing.
     cur_seq: AtomicU32,
-    thread_id: AtomicU32,
     sample_pos: AtomicU64,
     system_ns: AtomicU64,
     asio_time: UnsafeCell<ASIOTime>,
@@ -54,7 +55,9 @@ struct State {
     cfg: Config,
     error: String,
     buffers: Option<Buffers>,
-    thread: HANDLE,
+    /// Callback threads not joined yet: the current one, plus stale ones
+    /// that stopped from inside a host callback or did not exit in time.
+    threads: Vec<(HANDLE, DWORD)>,
     running: bool,
 }
 
@@ -80,7 +83,7 @@ impl Driver {
                 cfg: Config::default(),
                 error: String::new(),
                 buffers: None,
-                thread: null_mut(),
+                threads: Vec::new(),
                 running: false,
             }),
             cb: Arc::new(CbShared {
@@ -89,10 +92,9 @@ impl Driver {
                 time_info: AtomicBool::new(false),
                 can_reset: AtomicBool::new(false),
                 can_latency: AtomicBool::new(false),
-                stop: AtomicBool::new(false),
+                gen: AtomicU32::new(0),
                 start_seq: AtomicU32::new(0),
                 cur_seq: AtomicU32::new(0),
-                thread_id: AtomicU32::new(0),
                 sample_pos: AtomicU64::new(0),
                 system_ns: AtomicU64::new(0),
                 asio_time: UnsafeCell::new(ASIOTime::default()),
@@ -146,12 +148,19 @@ impl Driver {
     fn shutdown(&self) {
         self.stop();
         self.dispose_buffers();
+        let joined = self.reap_threads(2000);
         let mut st = self.lock();
         if st.handle != 0 {
-            self.cb.stop.store(true, SeqCst);
+            self.cb.gen.fetch_add(1, SeqCst);
             self.cb.handle.store(0, SeqCst);
-            let mut p = abi::HandleParams { handle: st.handle, ..Default::default() };
-            unix::call(call::EXIT, &mut p);
+            if joined {
+                let mut p = abi::HandleParams { handle: st.handle, ..Default::default() };
+                unix::call(call::EXIT, &mut p);
+            } else {
+                // A callback thread may still come back into the Unix side;
+                // leaking the engine beats freeing it under that thread.
+                log!("callback thread still running at shutdown; leaking the engine");
+            }
             st.handle = 0;
         }
     }
@@ -219,77 +228,108 @@ impl Driver {
     }
 
     fn start(&self) -> ASIOError {
+        {
+            let st = self.lock();
+            if st.handle == 0 || st.buffers.is_none() || self.cb.callbacks.load(SeqCst).is_null() {
+                return ASE_NotPresent;
+            }
+            if st.running {
+                return ASE_OK;
+            }
+        }
+        // Stale callback threads (e.g. stop() called from inside a callback)
+        // should be gone first. Without holding `st`: they may still be in
+        // the host, which may call back into us.
+        self.reap_threads(2000);
         let mut st = self.lock();
-        if st.handle == 0 || st.buffers.is_none() || self.cb.callbacks.load(SeqCst).is_null() {
-            return ASE_NotPresent;
+        if st.running || st.handle == 0 || st.buffers.is_none() {
+            return if st.running { ASE_OK } else { ASE_NotPresent };
         }
-        if st.running {
-            return ASE_OK;
-        }
-        // A previous callback thread that we could not join (stop() called
-        // from inside the callback) must be gone before we start a new one.
-        self.reap(&mut st, 2000);
         let mut p = abi::StartParams { handle: st.handle, ..Default::default() };
         if unix::call(call::START, &mut p) != 0 || p.status != abi::status::OK {
             st.error = format!("start failed ({})", p.status);
             return ASE_HWMalfunction;
         }
-        self.cb.stop.store(false, SeqCst);
+        let gen = self.cb.gen.fetch_add(1, SeqCst).wrapping_add(1);
         self.cb.start_seq.store(p.seq, SeqCst);
         self.cb.cur_seq.store(p.seq, SeqCst);
         self.cb.sample_pos.store(0, SeqCst);
         self.cb.system_ns.store(qpc_ns(), SeqCst);
-        let arg = Arc::into_raw(self.cb.clone()) as *mut c_void;
+        // Pin winepipe.dll while the thread runs; it drops the reference
+        // with FreeLibraryAndExitThread.
+        let mut module = null_mut();
+        // SAFETY: valid out pointer; the address lies inside this module.
+        unsafe {
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, thread_proc as *const u16, &mut module);
+        }
+        let arg = Box::into_raw(Box::new(ThreadArg { cb: self.cb.clone(), gen, module })) as *mut c_void;
         let mut tid = 0;
-        // SAFETY: thread_proc takes ownership of the Arc reference.
+        // SAFETY: thread_proc takes ownership of the ThreadArg.
         let th = unsafe { CreateThread(null_mut(), 0, thread_proc, arg, 0, &mut tid) };
         if th.is_null() {
-            // SAFETY: reclaim the reference the thread never took.
-            unsafe { drop(Arc::from_raw(arg as *const CbShared)) };
+            // SAFETY: the thread never started; reclaim what it would own.
+            unsafe {
+                drop(Box::from_raw(arg as *mut ThreadArg));
+                if !module.is_null() {
+                    FreeLibrary(module);
+                }
+            }
+            self.cb.gen.fetch_add(1, SeqCst);
             let mut s = abi::HandleParams { handle: st.handle, ..Default::default() };
             unix::call(call::STOP, &mut s);
             st.error = "could not create the callback thread".into();
             return ASE_HWMalfunction;
         }
-        self.cb.thread_id.store(tid, SeqCst);
-        st.thread = th;
+        st.threads.push((th, tid));
         st.running = true;
         log!("start");
         ASE_OK
     }
 
     fn stop(&self) -> ASIOError {
-        let mut st = self.lock();
-        if !st.running {
-            return ASE_OK;
-        }
-        self.cb.stop.store(true, SeqCst);
-        let mut p = abi::HandleParams { handle: st.handle, ..Default::default() };
+        let handle = {
+            let mut st = self.lock();
+            if !st.running {
+                return ASE_OK;
+            }
+            st.running = false;
+            self.cb.gen.fetch_add(1, SeqCst);
+            st.handle
+        };
+        // Neither the STOP call nor the join may hold `st`: the callback
+        // thread can be inside the host, and the host may call any driver
+        // method (getSampleRate, getLatencies, ...) from there.
+        let mut p = abi::HandleParams { handle, ..Default::default() };
         unix::call(call::STOP, &mut p);
-        st.running = false;
-        self.reap(&mut st, 3000);
+        self.reap_threads(3000);
         log!("stop");
         ASE_OK
     }
 
-    /// Join the callback thread (it has been told to stop). When called from
-    /// the callback thread itself (a host calling stop()/disposeBuffers()
-    /// from bufferSwitch or asioMessage) there is nothing to wait for: the
-    /// thread checks `stop` as soon as the host returns and exits.
-    fn reap(&self, st: &mut State, timeout_ms: DWORD) {
-        if st.thread.is_null() {
-            return;
-        }
-        // SAFETY: plain Win32 calls on a handle we own.
-        unsafe {
-            if GetCurrentThreadId() != self.cb.thread_id.load(SeqCst)
-                && WaitForSingleObject(st.thread, timeout_ms) != WAIT_OBJECT_0
-            {
+    /// Join every stale callback thread except the calling one. Returns true
+    /// when no *other* callback thread can still be running. Must not be
+    /// called with `st` held.
+    fn reap_threads(&self, timeout_ms: DWORD) -> bool {
+        let list = std::mem::take(&mut self.lock().threads);
+        // SAFETY: plain Win32 calls on handles we own.
+        let me = unsafe { GetCurrentThreadId() };
+        let mut keep = Vec::new();
+        let mut all = true;
+        for (h, tid) in list {
+            if tid == me {
+                // A host calling stop()/disposeBuffers()/Release() from its
+                // own callback: this thread exits once the host returns.
+                keep.push((h, tid));
+            } else if unsafe { WaitForSingleObject(h, timeout_ms) } == WAIT_OBJECT_0 {
+                unsafe { CloseHandle(h) };
+            } else {
                 log!("callback thread did not exit within {timeout_ms} ms (host stuck in bufferSwitch?)");
+                all = false;
+                keep.push((h, tid));
             }
-            CloseHandle(st.thread);
         }
-        st.thread = null_mut();
+        self.lock().threads.extend(keep);
+        all
     }
 
     fn get_channels(&self, ins: *mut i32, outs: *mut i32) -> ASIOError {
@@ -549,14 +589,21 @@ impl Driver {
 
     fn dispose_buffers(&self) -> ASIOError {
         self.stop();
+        let joined = self.reap_threads(2000);
         let mut st = self.lock();
         let Some(b) = st.buffers.take() else { return ASE_InvalidMode };
         let mut p = abi::HandleParams { handle: st.handle, ..Default::default() };
         unix::call(call::DISPOSE_BUFFERS, &mut p);
-        self.reap(&mut st, 2000);
-        // SAFETY: allocated in create_buffers; the Unix side no longer uses it.
-        unsafe { VirtualFree(b.mem, 0, MEM_RELEASE) };
         self.cb.callbacks.store(null_mut(), SeqCst);
+        if joined {
+            // SAFETY: allocated in create_buffers; neither the Unix side nor
+            // any callback thread uses it any more.
+            unsafe { VirtualFree(b.mem, 0, MEM_RELEASE) };
+        } else {
+            // Another thread may still be inside the host's bufferSwitch,
+            // writing into these buffers: leak them rather than free them.
+            log!("leaking ASIO buffers: a callback thread is still in the host");
+        }
         ASE_OK
     }
 
@@ -630,24 +677,32 @@ impl Driver {
     }
 }
 
+struct ThreadArg {
+    cb: Arc<CbShared>,
+    gen: u32,
+    module: HMODULE,
+}
+
 /// The ASIO callback thread: blocks in the Unix side until PipeWire's RT
 /// thread hands over a block, then runs the host's bufferSwitch.
+///
+/// After every call into the host the run generation is re-checked: the host
+/// may have stopped, restarted, disposed or released the driver from inside
+/// that call, and a stale thread must not touch the stream again.
 unsafe extern "system" fn thread_proc(arg: *mut c_void) -> DWORD {
-    let cb = Arc::from_raw(arg as *const CbShared);
+    let ThreadArg { cb, gen, module } = *Box::from_raw(arg as *mut ThreadArg);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    let current = |cb: &CbShared| cb.gen.load(Acquire) == gen;
     let handle = cb.handle.load(SeqCst);
     let mut p = abi::WaitParams { handle, last_done: cb.start_seq.load(SeqCst), timeout_ms: 200, ..Default::default() };
     let r = catch_unwind(AssertUnwindSafe(|| loop {
-        if cb.stop.load(Acquire) {
+        if !current(&cb) {
             break;
         }
-        if unix::call(call::WAIT, &mut p) != 0 {
+        if unix::call(call::WAIT, &mut p) != 0 || !current(&cb) {
             break;
         }
         let Some(cbs) = cb.callbacks.load(Acquire).as_ref().copied() else { break };
-        if p.events != 0 {
-            deliver_events(&cb, &cbs, handle, p.events);
-        }
         match p.result {
             abi::WAIT_SWITCH => {
                 cb.cur_seq.store(p.seq, Release);
@@ -671,13 +726,29 @@ unsafe extern "system" fn thread_proc(arg: *mut c_void) -> DWORD {
                     f(idx, 1);
                 }
                 p.last_done = p.seq;
+                if !current(&cb) {
+                    break;
+                }
+                if p.events != 0 {
+                    // Hand the block back before running the host's message
+                    // handlers, so they never eat into the cycle deadline.
+                    let mut r = abi::OutputReadyParams { handle, seq: p.seq, status: 0 };
+                    unix::call(call::OUTPUT_READY, &mut r);
+                }
             }
             abi::WAIT_STOPPED => break,
             _ => {}
         }
+        if p.events != 0 {
+            deliver_events(&cb, &cbs, handle, p.events);
+        }
     }));
     if r.is_err() {
         log!("callback thread panicked");
+    }
+    drop(cb);
+    if !module.is_null() {
+        FreeLibraryAndExitThread(module, 0);
     }
     0
 }

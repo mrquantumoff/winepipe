@@ -35,11 +35,11 @@ unsafe fn try_load() -> Result<UnixLib, String> {
     if ntdll.is_null() {
         return Err("ntdll.dll not found".into());
     }
-    let disp = GetProcAddress(ntdll, b"__wine_unix_call_dispatcher\0".as_ptr()) as *const Option<Dispatcher>;
+    let disp = GetProcAddress(ntdll, c"__wine_unix_call_dispatcher".as_ptr().cast()) as *const Option<Dispatcher>;
     let Some(dispatch) = disp.as_ref().copied().flatten() else {
         return Err("not running under Wine (no __wine_unix_call_dispatcher)".into());
     };
-    let q = GetProcAddress(ntdll, b"NtQueryVirtualMemory\0".as_ptr());
+    let q = GetProcAddress(ntdll, c"NtQueryVirtualMemory".as_ptr().cast());
     if q.is_null() {
         return Err("NtQueryVirtualMemory not found".into());
     }

@@ -73,6 +73,11 @@ run winepipe-test32.exe --buffer 256 --seconds 3
 run winepipe-test32.exe --buffer 64 --seconds 2 --cycles 2
 WINEPIPE_SAMPLE_TYPE=1 run winepipe-test64.exe --buffer 128 --seconds 2
 run winepipe-test64.exe --buffer 128 --seconds 2 --stall-ms 100
+# hosts that restart from inside bufferSwitch, or call into the driver
+# from there while another thread stops it
+run winepipe-test64.exe --buffer 128 --seconds 2 --inline-restart
+run winepipe-test32.exe --buffer 128 --seconds 2 --inline-restart
+run winepipe-test64.exe --buffer 128 --seconds 1 --query-in-callback
 
 if [ $live = 0 ]; then
     # Kill the server mid-stream: the host must get exactly one

@@ -409,6 +409,10 @@ impl Engine {
         let g = self.graph.borrow();
         let seen = self.shared.graph_rate.load(Relaxed);
         let req = self.requested_rate.get();
+        if req != 0 && req == seen {
+            // applied; from now on just follow the graph
+            self.requested_rate.set(0);
+        }
         if self.running() && seen != 0 {
             seen
         } else if req != 0 && req != seen {
@@ -567,7 +571,10 @@ impl Engine {
             return abi::status::INVALID_MODE;
         }
         let _g = self.lock();
-        if !self.connected.get() {
+        if !self.connected.get() || self.filter_state.get() == PW_FILTER_STATE_ERROR {
+            // The host was (or is about to be) asked to reset; a "started"
+            // stream that can never deliver a block would just hang it.
+            self.shared.h.raise(abi::EVENT_RESET_REQUEST);
             return abi::status::NOT_CONNECTED;
         }
         // SAFETY: not running.
@@ -642,12 +649,14 @@ impl Engine {
         unsafe {
             let me = libc::pthread_self();
             let mut res = -libc::ENOSYS;
-            {
+            let utils = {
                 let _g = self.lock();
-                let utils = pw_context_get_object(self.context.get(), TYPE_THREAD_UTILS.as_ptr() as *const c_char);
-                if !utils.is_null() {
-                    res = thread_utils_acquire_rt(utils, me as *mut spa_thread, want);
-                }
+                pw_context_get_object(self.context.get(), TYPE_THREAD_UTILS.as_ptr() as *const c_char)
+            };
+            // Called without the loop lock: module-rt may need the context's
+            // main loop (ours) to complete an RTKit request.
+            if !utils.is_null() {
+                res = thread_utils_acquire_rt(utils, me as *mut spa_thread, want);
             }
             if res < 0 {
                 let max = libc::sched_get_priority_max(libc::SCHED_FIFO);

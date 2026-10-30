@@ -42,6 +42,13 @@ wow64="$prefix/drive_c/windows/syswow64"
 # installed into Wine's own lib dir.
 export WINEDLLPATH="$dlldir${WINEDLLPATH:+:$WINEDLLPATH}"
 
+# Copy next to the target, then rename over it. Writing into the existing
+# file (cp) would modify a DLL that running applications have mapped.
+install_dll() {
+    tmp="$2.winepipe-new.$$"
+    cp "$1" "$tmp" && mv -f "$tmp" "$2" || { rm -f "$tmp"; return 1; }
+}
+
 if [ $unregister = 1 ]; then
     "$WINE" regsvr32 /s /u winepipe.dll || true
     [ -d "$wow64" ] && "$WINE" "C:\\windows\\syswow64\\regsvr32.exe" /s /u winepipe.dll || true
@@ -50,12 +57,12 @@ if [ $unregister = 1 ]; then
     exit 0
 fi
 
-cp -f "$dlldir/x86_64-windows/winepipe.dll" "$sys32/winepipe.dll"
+install_dll "$dlldir/x86_64-windows/winepipe.dll" "$sys32/winepipe.dll"
 "$WINE" regsvr32 /s winepipe.dll
 echo "64-bit driver registered"
 
 if [ -d "$wow64" ] && [ -f "$dlldir/i386-windows/winepipe.dll" ]; then
-    cp -f "$dlldir/i386-windows/winepipe.dll" "$wow64/winepipe.dll"
+    install_dll "$dlldir/i386-windows/winepipe.dll" "$wow64/winepipe.dll"
     "$WINE" "C:\\windows\\syswow64\\regsvr32.exe" /s winepipe.dll
     echo "32-bit driver registered"
 fi

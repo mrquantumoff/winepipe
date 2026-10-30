@@ -49,6 +49,15 @@ fn spawn_host(h: Arc<Handoff>, start: u32, ins: [SendPtr; 2], outs: [SendPtr; 2]
     })
 }
 
+/// The driver arms the RT side when the callback thread first waits.
+fn wait_armed(h: &Handoff) {
+    let until = futex::now_ns() + 2_000_000_000;
+    while !h.armed() {
+        assert!(futex::now_ns() < until, "callback thread never armed");
+        thread::sleep(Duration::from_micros(100));
+    }
+}
+
 fn run_loopback(n: usize, b: usize, cycles: usize, st: u32) -> (Vec<f32>, Vec<f32>, usize, Arc<Handoff>) {
     let h = Arc::new(Handoff::new());
     let mut bufs = Bufs::new(b);
@@ -64,6 +73,7 @@ fn run_loopback(n: usize, b: usize, cycles: usize, st: u32) -> (Vec<f32>, Vec<f3
     s.reset();
     let start = h.begin();
     let host = spawn_host(h.clone(), start, ins, outs, b, None);
+    wait_armed(&h);
 
     let total = n * cycles;
     let input: Vec<f32> = (0..total).map(|i| ((i % 1000) as f32 + 1.0) / 1024.0).collect();
@@ -151,6 +161,7 @@ fn late_host_is_dropped_and_recovers() {
     let start = h.begin();
     // stall for 30 ms on the 5th switch; period is 5.3 ms
     let host = spawn_host(h.clone(), start, ins, outs, b, Some((5, Duration::from_millis(30))));
+    wait_armed(&h);
 
     let input = vec![0.5f32; n];
     let mut output = vec![0.0f32; n];
@@ -192,6 +203,7 @@ fn halt_while_host_busy() {
     s.reset();
     let start = h.begin();
     let host = spawn_host(h.clone(), start, ins, outs, b, Some((0, Duration::from_millis(200))));
+    wait_armed(&h);
     let h2 = h.clone();
     let rt = thread::spawn(move || {
         let input = vec![0.0f32; 64];
@@ -230,4 +242,73 @@ fn events_wake_the_callback_thread() {
     h.halt();
     h.wait(&mut p);
     assert_eq!(p.result, abi::WAIT_STOPPED);
+}
+
+/// Until the callback thread is waiting, the RT side must neither issue
+/// blocks (they could only run into the deadline) nor emit stale data.
+#[test]
+fn silent_until_armed() {
+    let b = 64;
+    let h = Handoff::new();
+    let mut bufs = Bufs::new(b);
+    let mut s = Session::new(
+        b,
+        abi::SAMPLE_FLOAT32,
+        vec![Chan { port: 0, buf: [bufs.ptr(0), bufs.ptr(1)] }],
+        vec![Chan { port: 0, buf: [bufs.ptr(2), bufs.ptr(3)] }],
+        vec![],
+    );
+    s.reset();
+    h.begin();
+    let input = vec![0.5f32; b];
+    let mut output = vec![1.0f32; b];
+    let cyc = Cycle { n: b, rate: 48000, nsec: futex::now_ns(), next_nsec: 0, freewheel: false };
+    let t0 = futex::now_ns();
+    assert!(h.enter());
+    unsafe { s.process(&h, &[input.as_ptr()], &[output.as_mut_ptr()], &cyc) };
+    h.leave();
+    assert!(futex::now_ns() - t0 < 1_000_000, "process blocked before the host was armed");
+    assert!(output.iter().all(|&x| x == 0.0));
+    assert_eq!(h.stats.switches.load(Relaxed), 0);
+    assert_eq!(h.stats.late.load(Relaxed), 0);
+    h.halt();
+}
+
+/// A reset request raised while stopped must survive the next start.
+#[test]
+fn reset_request_survives_begin() {
+    let h = Handoff::new();
+    h.raise(abi::EVENT_RESET_REQUEST | abi::EVENT_LATENCY_CHANGED);
+    let start = h.begin();
+    let mut p = abi::WaitParams { last_done: start, timeout_ms: 50, ..Default::default() };
+    h.wait(&mut p);
+    assert_eq!(p.events, abi::EVENT_RESET_REQUEST);
+    h.halt();
+}
+
+/// raise()/halt() wakes must never be lost between the waiter's checks and
+/// its futex sleep: hammer them and require prompt returns.
+#[test]
+fn no_lost_wakeups() {
+    let h = Arc::new(Handoff::new());
+    for round in 0..200 {
+        let start = h.begin();
+        let h2 = h.clone();
+        let waiter = thread::spawn(move || {
+            let mut p = abi::WaitParams { last_done: start, timeout_ms: 5000, ..Default::default() };
+            let t0 = futex::now_ns();
+            loop {
+                h2.wait(&mut p);
+                if p.result == abi::WAIT_STOPPED {
+                    return futex::now_ns() - t0;
+                }
+            }
+        });
+        if round % 2 == 0 {
+            h.raise(abi::EVENT_LATENCY_CHANGED);
+        }
+        h.halt();
+        let took = waiter.join().unwrap();
+        assert!(took < 1_000_000_000, "round {round}: stop took {took} ns");
+    }
 }
