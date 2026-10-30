@@ -51,6 +51,24 @@ sudo make install       # PREFIX=/usr/local, WINELIBDIR auto-detected
 install into that build's library directory instead, e.g.
 `make install-driver WINELIBDIR=~/.local/opt/wine/lib/wine PREFIX=~/.local`.
 
+### Build and install for one prefix
+
+`scripts/install-to-prefix.sh` does everything for a single prefix. It
+builds the driver and settings app, installs the driver into the library
+directory of the Wine that runs the prefix (using sudo only if that
+directory isn't writable), puts the tools in `~/.local`, and registers the
+driver:
+
+```sh
+WINEPREFIX=~/.wine-daw scripts/install-to-prefix.sh
+WINEPREFIX=~/.wine-daw WINE=~/.local/opt/wine-custom/bin/wine scripts/install-to-prefix.sh --check
+```
+
+Options: `--no-settings`, `--no-sudo` (install into `~/.local/lib/winepipe`
+and use `WINEDLLPATH` instead), `--tools-prefix DIR`, and `--check` (a 2 s
+silent test run in the prefix). It's safe to run while applications in the
+prefix are open; restart them to load the new driver.
+
 ### Register it in a Wine prefix
 
 Once per prefix:
