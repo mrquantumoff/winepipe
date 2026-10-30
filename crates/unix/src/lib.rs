@@ -144,13 +144,38 @@ fn wine_binary() -> Option<std::path::PathBuf> {
     wine.is_file().then_some(wine)
 }
 
+/// Locate an executable file, resolved here in the parent: a failed exec in
+/// a child forked from a Wine process cannot be reported or cleaned up
+/// reliably.
+fn find_settings_binary() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    let runnable = |p: &Path| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if let Some(explicit) = std::env::var_os("WINEPIPE_SETTINGS") {
+        let p = PathBuf::from(explicit);
+        return runnable(&p).then_some(p);
+    }
+    let name = "winepipe-settings";
+    let from_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).map(|d| d.join(name)).collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Apps started from a desktop entry often lack ~/.local/bin in PATH.
+    let extra = std::env::var_os("HOME")
+        .map(|h| Path::new(&h).join(".local/bin").join(name))
+        .into_iter()
+        .chain(["/usr/local/bin", "/usr/bin"].map(|d| Path::new(d).join(name)));
+    from_path.into_iter().chain(extra).find(|p| runnable(p))
+}
+
 fn launch_settings() -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    let exe = find_settings_binary()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "winepipe-settings not found"))?;
     let prefix = std::env::var_os("WINEPREFIX")
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".wine").into_os_string()));
-    let exe = std::env::var_os("WINEPIPE_SETTINGS").unwrap_or_else(|| "winepipe-settings".into());
     let mut cmd = Command::new(&exe);
     if let Some(p) = prefix {
         cmd.arg("--prefix").arg(p);
@@ -158,40 +183,13 @@ fn launch_settings() -> std::io::Result<()> {
     if let Some(w) = std::env::var_os("WINELOADER").map(std::path::PathBuf::from).or_else(wine_binary) {
         cmd.arg("--wine").arg(w);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    // SAFETY: only async-signal-safe calls between fork and exec. Detach
-    // from the Wine process and don't leak its descriptors (wineserver
-    // socket etc.) into the UI.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
-            Ok(())
-        });
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if std::env::var_os("WINEPIPE_SETTINGS").is_none() => {
-            // not on PATH: try the per-user install location
-            let local = std::env::var_os("HOME")
-                .map(|h| std::path::Path::new(&h).join(".local/bin/winepipe-settings"))
-                .filter(|p| p.is_file())
-                .ok_or(e)?;
-            let mut c2 = Command::new(local);
-            c2.args(cmd.get_args());
-            c2.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            // SAFETY: as above.
-            unsafe {
-                c2.pre_exec(|| {
-                    libc::setsid();
-                    libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
-                    Ok(())
-                });
-            }
-            c2.spawn()?
-        }
-        Err(e) => return Err(e),
-    };
+    // No pre_exec hook: that would force fork() and run Rust code in a child
+    // of the (heavily multithreaded, signal-handling) Wine process. With
+    // only a process group set, std uses posix_spawn, which execs directly
+    // with a clean signal mask and default handlers.
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+    let mut child = cmd.spawn()?;
+    log!("control panel: started {} (pid {})", exe.display(), child.id());
     // reap it so it never lingers as a zombie of the Wine process
     std::thread::spawn(move || {
         let _ = child.wait();

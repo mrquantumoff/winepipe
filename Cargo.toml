@@ -6,7 +6,7 @@ members = ["crates/abi", "crates/unix", "crates/pe", "crates/asiotest", "crates/
 default-members = ["crates/abi", "crates/unix"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 license = "BSD-2-Clause"
 repository = "https://github.com/mrquantumoff/winepipe"
 edition = "2021"

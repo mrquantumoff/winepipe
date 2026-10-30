@@ -6315,25 +6315,25 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winepipe-abi"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "winepipe-asiotest"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "winepipe-abi",
 ]
 
 [[package]]
 name = "winepipe-pe"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "winepipe-abi",
 ]
 
 [[package]]
 name = "winepipe-settings"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dirs",
  "libcosmic",
@@ -6342,7 +6342,7 @@ dependencies = [
 
 [[package]]
 name = "winepipe-unix"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "libc",
  "winepipe-abi",
