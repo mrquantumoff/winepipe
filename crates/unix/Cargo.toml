@@ -1,0 +1,15 @@
+[package]
+name = "winepipe-unix"
+description = "WinePipe Unix side: PipeWire engine loaded by Wine's ntdll"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "winepipe"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+winepipe-abi = { path = "../abi" }
+libc = "0.2"

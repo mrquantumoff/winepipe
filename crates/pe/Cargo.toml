@@ -1,0 +1,14 @@
+[package]
+name = "winepipe-pe"
+description = "WinePipe PE side: the IASIO COM driver (winepipe.dll)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "winepipe"
+crate-type = ["cdylib"]
+
+[dependencies]
+winepipe-abi = { path = "../abi" }

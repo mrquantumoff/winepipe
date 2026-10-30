@@ -1,0 +1,14 @@
+[package]
+name = "winepipe-asiotest"
+description = "Minimal ASIO host for testing WinePipe under Wine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "winepipe-test"
+path = "src/main.rs"
+
+[dependencies]
+winepipe-abi = { path = "../abi" }

@@ -1,0 +1,51 @@
+#!/bin/sh
+# Show or change WinePipe settings (HKCU\Software\WinePipe) in a Wine prefix.
+#
+#   winepipe-config                      show current settings
+#   winepipe-config [options]            change settings
+#
+# Options:
+#   --inputs N          number of input channels (0-64, default 2)
+#   --outputs N         number of output channels (0-64, default 2)
+#   --buffer N          preferred buffer size in frames (16-8192, default 256)
+#   --fixed 0|1         only allow the preferred buffer size (default 0)
+#   --autoconnect 0|1   link to the default sink/source on start (default 1)
+#   --float32 | --int32 ASIO sample format (default float32)
+#   --name NAME         PipeWire node name (default WinePipe)
+#   --reset             remove all settings (back to defaults)
+#
+# Uses $WINEPREFIX (default ~/.wine) and $WINE (default wine). Changes apply
+# the next time a host loads the driver.
+set -eu
+WINE=${WINE:-wine}
+KEY='HKCU\Software\WinePipe'
+export WINEDEBUG=${WINEDEBUG:--all}
+
+dword() { "$WINE" reg add "$KEY" /v "$1" /t REG_DWORD /d "$2" /f >/dev/null; }
+num() {
+    case "$2" in ''|*[!0-9]*) echo "winepipe-config: $1 needs a number" >&2; exit 2;; esac
+}
+
+if [ $# -eq 0 ]; then
+    echo "WinePipe settings in ${WINEPREFIX:-$HOME/.wine} (missing values use defaults):"
+    "$WINE" reg query "$KEY" 2>/dev/null | sed -n 's/^ \{4\}/  /p' || true
+    exit 0
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --inputs)      num "$1" "${2:-}"; dword Inputs "$2"; shift ;;
+        --outputs)     num "$1" "${2:-}"; dword Outputs "$2"; shift ;;
+        --buffer)      num "$1" "${2:-}"; dword PreferredBufferSize "$2"; shift ;;
+        --fixed)       num "$1" "${2:-}"; dword FixedBufferSize "$2"; shift ;;
+        --autoconnect) num "$1" "${2:-}"; dword AutoConnect "$2"; shift ;;
+        --float32)     dword SampleType 0 ;;
+        --int32)       dword SampleType 1 ;;
+        --name)        "$WINE" reg add "$KEY" /v ClientName /t REG_SZ /d "${2:?--name needs a value}" /f >/dev/null; shift ;;
+        --reset)       "$WINE" reg delete "$KEY" /f >/dev/null 2>&1 || true ;;
+        -h|--help)     sed -n '2,20s/^# \{0,1\}//p' "$0"; exit 0 ;;
+        *) echo "winepipe-config: unknown option $1 (see --help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+echo "saved"

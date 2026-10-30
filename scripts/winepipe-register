@@ -1,0 +1,64 @@
+#!/bin/sh
+# Register (or with -u, unregister) the WinePipe ASIO driver in a Wine prefix.
+#
+#   winepipe-register [-u] [DLLDIR]
+#
+# DLLDIR is a directory in Wine's layout containing x86_64-windows/ and
+# i386-windows/ (e.g. a build/ tree or Wine's own lib dir). By default it is
+# looked up next to this script, then in the usual Wine library directories.
+# Uses $WINEPREFIX (default ~/.wine) and $WINE (default wine).
+set -eu
+
+unregister=0
+if [ "${1:-}" = "-u" ]; then unregister=1; shift; fi
+
+WINE=${WINE:-wine}
+prefix=${WINEPREFIX:-$HOME/.wine}
+here=$(cd "$(dirname "$0")" && pwd)
+
+dlldir=${1:-}
+if [ -z "$dlldir" ]; then
+    for d in "$here/../build" "$here/../lib/wine" /usr/lib/wine /usr/lib64/wine \
+             /usr/local/lib/wine /opt/wine-staging/lib/wine /opt/wine-stable/lib/wine; do
+        if [ -f "$d/x86_64-windows/winepipe.dll" ]; then dlldir=$d; break; fi
+    done
+fi
+if [ -z "$dlldir" ] || [ ! -f "$dlldir/x86_64-windows/winepipe.dll" ]; then
+    echo "winepipe-register: cannot find x86_64-windows/winepipe.dll (pass the directory)" >&2
+    exit 1
+fi
+dlldir=$(cd "$dlldir" && pwd)
+
+if [ ! -d "$prefix/drive_c/windows/system32" ]; then
+    echo "winepipe-register: $prefix is not an initialized Wine prefix (run wineboot first)" >&2
+    exit 1
+fi
+
+sys32="$prefix/drive_c/windows/system32"
+wow64="$prefix/drive_c/windows/syswow64"
+
+# Wine resolves builtin DLLs through a (builtin-marked) file in system32 /
+# syswow64; WINEDLLPATH lets it find the matching .so when the files are not
+# installed into Wine's own lib dir.
+export WINEDLLPATH="$dlldir${WINEDLLPATH:+:$WINEDLLPATH}"
+
+if [ $unregister = 1 ]; then
+    "$WINE" regsvr32 /s /u winepipe.dll || true
+    [ -d "$wow64" ] && "$WINE" "C:\\windows\\syswow64\\regsvr32.exe" /s /u winepipe.dll || true
+    rm -f "$sys32/winepipe.dll" "$wow64/winepipe.dll"
+    echo "WinePipe unregistered from $prefix"
+    exit 0
+fi
+
+cp -f "$dlldir/x86_64-windows/winepipe.dll" "$sys32/winepipe.dll"
+"$WINE" regsvr32 /s winepipe.dll
+echo "64-bit driver registered"
+
+if [ -d "$wow64" ] && [ -f "$dlldir/i386-windows/winepipe.dll" ]; then
+    cp -f "$dlldir/i386-windows/winepipe.dll" "$wow64/winepipe.dll"
+    "$WINE" "C:\\windows\\syswow64\\regsvr32.exe" /s winepipe.dll
+    echo "32-bit driver registered"
+fi
+
+# A Wine library dir (has ntdll.so) is searched by that Wine anyway.
+[ -f "$dlldir/x86_64-unix/ntdll.so" ] || echo "note: run applications with WINEDLLPATH=$dlldir"

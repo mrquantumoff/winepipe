@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=WinePipe Settings
+GenericName=ASIO Driver Settings
+Comment=Configure the WinePipe ASIO driver for Wine applications
+Exec=winepipe-settings
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;Settings;
+Keywords=ASIO;Wine;PipeWire;Audio;DAW;
+StartupWMClass=io.github.mrquantumoff.WinePipe

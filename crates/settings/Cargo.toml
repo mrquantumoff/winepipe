@@ -1,0 +1,20 @@
+[package]
+name = "winepipe-settings"
+description = "Settings UI for the WinePipe ASIO driver (libcosmic)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "winepipe-settings"
+path = "src/main.rs"
+
+[dependencies]
+dirs = "6"
+tokio = { version = "1", features = ["rt"] }
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+default-features = false
+features = ["winit", "tokio", "wayland", "x11", "a11y", "dbus-config"]

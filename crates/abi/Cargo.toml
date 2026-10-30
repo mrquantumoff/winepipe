@@ -1,0 +1,10 @@
+[package]
+name = "winepipe-abi"
+description = "Unix-call ABI shared by the WinePipe PE and Unix halves"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"

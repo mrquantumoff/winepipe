@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/abi", "crates/unix", "crates/pe", "crates/asiotest", "crates/settings"]
+# The PE crates only build for *-pc-windows-gnu; the Makefile builds them
+# with an explicit --target.
+default-members = ["crates/abi", "crates/unix"]
+
+[workspace.package]
+version = "1.0.0"
+license = "BSD-2-Clause"
+repository = "https://github.com/mrquantumoff/winepipe"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+strip = "debuginfo"
+panic = "unwind"
